@@ -57,40 +57,13 @@ export function ChatWidget() {
           <header className="border-b border-border px-5 py-4">
             <p className="eyebrow text-accent">{SITE.name}</p>
             <p className="mt-1 text-sm text-muted-foreground">
-              {chat.status === "error"
-                ? "This widget is not connected yet."
-                : chat.status === "open"
-                  ? "We usually reply within one business day."
-                  : "Tell us who you are and what it concerns."}
+              {chat.status === "open"
+                ? "We usually reply within one business day."
+                : "Tell us who you are and what it concerns."}
             </p>
           </header>
 
-          {chat.error && chat.status !== "error" ? (
-            <p
-              role="alert"
-              className="border-b border-destructive/30 bg-destructive/10 px-5 py-3 text-xs leading-relaxed text-foreground"
-            >
-              {chat.error}
-            </p>
-          ) : null}
-
-          {chat.status === "error" ? (
-            <div className="flex-1 space-y-3 px-5 py-6">
-              <p className="text-sm font-medium text-foreground">Live chat is unavailable</p>
-              <p className="text-xs leading-relaxed text-muted-foreground">{chat.error}</p>
-              <p className="text-xs leading-relaxed text-muted-foreground">
-                In the meantime, email us at{" "}
-                <a href={`mailto:${settings.email}`} className="text-accent link-underline">
-                  {settings.email}
-                </a>{" "}
-                or use the{" "}
-                <a href="/contact" className="text-accent link-underline">
-                  contact form
-                </a>
-                .
-              </p>
-            </div>
-          ) : chat.status === "loading" ? (
+          {chat.status === "loading" ? (
             <p className="flex-1 px-5 py-6 text-sm text-muted-foreground">Loading…</p>
           ) : chat.status === "open" ? (
             <>

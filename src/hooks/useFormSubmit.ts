@@ -2,9 +2,27 @@ import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useState, type FormEvent } from "react";
 
 import { submitForm, type SubmitFormInput } from "@/lib/api/forms";
-import { readableError } from "@/lib/readable-error";
+import { describeError } from "@/lib/readable-error";
 
 export type FormValues = Record<string, string>;
+
+/**
+ * What a visitor sees when a submission fails. A validation message is about
+ * their input, so it is shown; anything else is ours to fix, so it goes to the
+ * console and they get a plain "try again".
+ */
+function visitorMessage(error: unknown): string {
+  const { message } = describeError(error);
+  try {
+    const issues = JSON.parse(message) as Array<{ message?: unknown }>;
+    const first = Array.isArray(issues) ? issues[0]?.message : undefined;
+    if (typeof first === "string" && first) return first;
+  } catch {
+    /* not a validation error */
+  }
+  console.error("[forms] submission failed:", message);
+  return "That did not go through. Please try again in a moment.";
+}
 
 export type FormSubmit<T extends FormValues> = {
   values: T;
@@ -50,7 +68,7 @@ export function useFormSubmit<T extends FormValues>(
           await send({ data: build(values) });
           setSuccess(true);
         } catch (caught) {
-          setError(readableError(caught));
+          setError(visitorMessage(caught));
         } finally {
           setSubmitting(false);
         }

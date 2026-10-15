@@ -1,8 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
-import { SITE } from "../site";
-
 // Form submissions never touch the database from the browser. `enquiries` and
 // `bookings` have no anon policy at all — this server function holds the
 // service-role key, so a leaked anon key cannot stuff the inbox.
@@ -48,6 +46,8 @@ const chatSchema = z.object({
   name: trimmed(200).min(1),
   email: optionalText(320),
   message: trimmed(4000).min(1),
+  /** The widget could not save this to the database; email is all there is. */
+  unsaved: z.boolean().optional(),
   website: honeypot,
 });
 
@@ -72,10 +72,13 @@ export const submitForm = createServerFn({ method: "POST" })
 
     if (data.kind === "chat") {
       // The widget writes its own rows under the visitor's session — RLS can
-      // express "your own chat" precisely. All this does is ring the bell.
+      // express "your own chat" precisely. All this does is ring the bell,
+      // unless the widget could not write, when this email is the message.
       await notify(shared, {
-        subject: `New chat message from ${data.name}`,
-        heading: "A visitor started a chat",
+        subject: data.unsaved
+          ? `Chat message from ${data.name} (reply by email)`
+          : `New chat message from ${data.name}`,
+        heading: data.unsaved ? "A visitor sent a chat message" : "A visitor started a chat",
         rows: [
           ["Name", data.name],
           ["Email", data.email ?? "—"],
@@ -83,39 +86,21 @@ export const submitForm = createServerFn({ method: "POST" })
           ["Session", data.sessionId],
         ],
         ...(data.email ? { replyTo: data.email } : {}),
-        footer: "Reply in the Live chat tab of the dashboard.",
+        footer: data.unsaved
+          ? "Live chat could not save this message, so it is not in the dashboard. Reply to the visitor by email. /api/health?probe=chat names what is wrong."
+          : "Reply in the Live chat tab of the dashboard.",
       });
       return { ok: true, id: data.sessionId };
     }
 
-    // No database on this deployment yet. The raw reason names environment
-    // variables, which means nothing to a visitor and is not theirs to fix, so
-    // they get something they can act on and the real cause goes to the log.
-    if (!shared.SUPABASE_URL || !shared.SERVICE_ROLE_KEY) {
-      console.error(
-        `[forms] ${data.kind === "enquiry" ? "an inquiry" : "a booking"} was submitted, but Supabase is not configured on the server. See /api/health.`,
-      );
-      throw new Error(`We could not send this just now. Please email us at ${SITE.email}.`);
-    }
-
-    const db = shared.adminClient();
+    // The visitor always gets a normal "thank you". If the database cannot take
+    // the row, the email below is the record, and the reason goes to the log.
+    const saved = await save(shared, data);
+    const unsavedNote = saved.ok
+      ? ""
+      : " This one could not be saved to the dashboard, so this email is the only copy; /api/health names what is wrong.";
 
     if (data.kind === "enquiry") {
-      const { data: row, error } = await db
-        .from("enquiries")
-        .insert({
-          name: data.name,
-          company: data.company ?? null,
-          email: data.email,
-          phone: data.phone ?? null,
-          subject: data.subject ?? null,
-          scope: data.scope,
-        })
-        .select("id")
-        .single();
-
-      if (error) throw new Error(`Could not save the inquiry: ${error.message}`);
-
       await notify(shared, {
         subject: `New inquiry — ${data.subject || data.name}`,
         heading: "New inquiry",
@@ -128,46 +113,79 @@ export const submitForm = createServerFn({ method: "POST" })
           ["Brief", data.scope],
         ],
         replyTo: data.email,
-        footer: "Open the Inquiries tab of the dashboard to reply.",
+        footer: `Open the Inquiries tab of the dashboard to reply.${unsavedNote}`,
       });
-
-      return { ok: true, id: String(row?.["id"] ?? "") || null };
+    } else {
+      await notify(shared, {
+        subject: `New booking request — ${data.name}`,
+        heading: "New consultation booking",
+        rows: [
+          ["Name", data.name],
+          ["Email", data.email],
+          ["Phone", data.phone ?? ""],
+          ["Consultation", data.service],
+          ["Preferred date", data.preferredDate],
+          ["Preferred time", data.preferredTime],
+          ["Notes", data.notes ?? ""],
+        ],
+        replyTo: data.email,
+        footer: `Open the Bookings tab of the dashboard to confirm.${unsavedNote}`,
+      });
     }
 
-    const { data: row, error } = await db
-      .from("bookings")
-      .insert({
-        patient_name: data.name,
-        email: data.email,
-        phone: data.phone ?? null,
-        service: data.service,
-        preferred_date: data.preferredDate,
-        preferred_time: data.preferredTime,
-        notes: data.notes ?? null,
-      })
-      .select("id")
-      .single();
-
-    if (error) throw new Error(`Could not save the booking: ${error.message}`);
-
-    await notify(shared, {
-      subject: `New booking request — ${data.name}`,
-      heading: "New consultation booking",
-      rows: [
-        ["Name", data.name],
-        ["Email", data.email],
-        ["Phone", data.phone ?? ""],
-        ["Consultation", data.service],
-        ["Preferred date", data.preferredDate],
-        ["Preferred time", data.preferredTime],
-        ["Notes", data.notes ?? ""],
-      ],
-      replyTo: data.email,
-      footer: "Open the Bookings tab of the dashboard to confirm.",
-    });
-
-    return { ok: true, id: String(row?.["id"] ?? "") || null };
+    return { ok: true, id: saved.ok ? saved.id : null };
   });
+
+/** Writes the row, or logs why it could not. Never throws. */
+async function save(
+  shared: SharedModule,
+  data: Exclude<SubmitFormInput, { kind: "chat" }>,
+): Promise<{ ok: true; id: string | null } | { ok: false }> {
+  const label = data.kind === "enquiry" ? "inquiry" : "booking";
+  if (!shared.SUPABASE_URL || !shared.SERVICE_ROLE_KEY) {
+    console.error(
+      `[forms] an ${label} arrived, but Supabase is not configured on the server. See /api/health.`,
+    );
+    return { ok: false };
+  }
+
+  try {
+    const db = shared.adminClient();
+    const { data: row, error } =
+      data.kind === "enquiry"
+        ? await db
+            .from("enquiries")
+            .insert({
+              name: data.name,
+              company: data.company ?? null,
+              email: data.email,
+              phone: data.phone ?? null,
+              subject: data.subject ?? null,
+              scope: data.scope,
+            })
+            .select("id")
+            .single()
+        : await db
+            .from("bookings")
+            .insert({
+              patient_name: data.name,
+              email: data.email,
+              phone: data.phone ?? null,
+              service: data.service,
+              preferred_date: data.preferredDate,
+              preferred_time: data.preferredTime,
+              notes: data.notes ?? null,
+            })
+            .select("id")
+            .single();
+
+    if (error) throw error;
+    return { ok: true, id: String(row?.["id"] ?? "") || null };
+  } catch (error) {
+    console.error(`[forms] could not save the ${label}:`, shared.errorMessage(error));
+    return { ok: false };
+  }
+}
 
 type SharedModule = typeof import("./_shared.server");
 

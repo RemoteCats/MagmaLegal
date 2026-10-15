@@ -1,5 +1,5 @@
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { ChatMessage } from "@/lib/database.types";
 import { submitForm } from "@/lib/api/forms";
@@ -9,13 +9,12 @@ import { visitorSupabase as supabase } from "@/lib/supabase";
 
 const STORAGE_KEY = "haven.chat.session";
 
-export type ChatStatus = "loading" | "new" | "open" | "error";
+export type ChatStatus = "loading" | "new" | "open";
 
 export type VisitorChat = {
   status: ChatStatus;
   sessionId: string | null;
   messages: ChatMessage[];
-  error: string | null;
   sending: boolean;
   start: (input: { name: string; email: string; message: string }) => Promise<void>;
   send: (body: string) => Promise<boolean>;
@@ -41,35 +40,43 @@ function writeStoredSession(id: string | null): void {
   }
 }
 
-const ANON_DISABLED =
-  "Live chat is switched off on this project: anonymous sign-ins are disabled. Turn them on in the Supabase dashboard under Authentication → Sign In / Providers → Anonymous sign-ins, then reload this page.";
-
-const UNREACHABLE =
-  "Live chat could not reach the database, so that message was not sent. This is usually the Supabase project being paused or asleep. /api/health shows which project this deployment points at.";
-
-const REFUSED =
-  "We could not save that message. Live chat is not set up correctly on this site, which is our problem rather than yours. Please email us or use the contact form and we will pick it up there.";
-
-/** The shared reader, plus the failures worth naming their own fix for. */
-export function readableError(error: unknown): string {
+/**
+ * Visitors never see why a chat write failed: the message is shown as sent,
+ * emailed to the firm instead, and the real reason goes to the console where
+ * whoever runs the site will look. /api/health?probe=chat names the fix.
+ */
+function logChatFailure(step: string, error: unknown): void {
   const { message, kind, hint, code } = describeError(error);
-  if (kind === "anonymous-disabled") return ANON_DISABLED;
-  if (kind === "network") return UNREACHABLE;
-  if (kind === "unconfigured") return message;
+  const detail = [message, hint, code ? `(${code})` : ""].filter(Boolean).join(" — ");
+  const advice =
+    kind === "anonymous-disabled"
+      ? "Turn on anonymous sign-ins in Supabase → Authentication → Sign In / Providers."
+      : kind === "network"
+        ? "The Supabase project could not be reached; it may be paused."
+        : "Run /api/health?probe=chat to see which step fails and why.";
+  console.error(
+    `[chat] ${step} failed: ${detail}\n[chat] ${advice} The message was emailed to the firm instead.`,
+  );
+}
 
-  // A visitor cannot act on "new row violates row-level security policy", and
-  // should not have to read it. Whoever runs the site can: put the real reason
-  // where they will find it and point at the page that names the fix.
-  if (code === "42501" || /row-level security|permission denied/i.test(message)) {
-    console.error(
-      `[chat] the database refused the write: ${message}${hint ? ` — ${hint}` : ""}${code ? ` (${code})` : ""}\n` +
-        "[chat] /api/health reports which policy is missing; it is usually chat_messages_visitor_insert, restored by re-running supabase/migrations/0001_init.sql.",
-    );
-    return REFUSED;
-  }
+/** Conversations that live only in this tab, carried by email. */
+const UNSAVED_PREFIX = "unsaved-";
+const isUnsaved = (id: string) => id.startsWith(UNSAVED_PREFIX);
 
-  const suffix = [hint, code ? `(${code})` : ""].filter(Boolean).join(" ");
-  return suffix ? `${message} ${suffix}` : message;
+function newId(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function localMessage(sessionId: string, body: string): ChatMessage {
+  return {
+    id: newId(),
+    session_id: sessionId,
+    sender: "visitor",
+    body,
+    created_at: new Date().toISOString(),
+  };
 }
 
 async function sessionIsLost(sessionId: string): Promise<boolean> {
@@ -119,9 +126,11 @@ export function useVisitorChat(): VisitorChat {
   const [status, setStatus] = useState<ChatStatus>("loading");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [live, setLive] = useState(false);
+  // Who the visitor said they were, for the email that carries a message the
+  // database would not take.
+  const visitor = useRef<{ name: string; email?: string }>({ name: "Website visitor" });
 
   const notify = useServerFn(submitForm);
 
@@ -134,6 +143,27 @@ export function useVisitorChat(): VisitorChat {
         : [...current, incoming].sort((a, b) => a.created_at.localeCompare(b.created_at)),
     );
   }, []);
+
+  /** Sends one message to the firm by email. Never throws. */
+  const emailMessage = useCallback(
+    async (id: string, message: string) => {
+      try {
+        await notify({
+          data: {
+            kind: "chat",
+            sessionId: id,
+            name: visitor.current.name,
+            email: visitor.current.email,
+            message,
+            unsaved: isUnsaved(id),
+          },
+        });
+      } catch (caught) {
+        console.error("[chat] the email fallback failed too:", describeError(caught).message);
+      }
+    },
+    [notify],
+  );
 
   const syncMessages = useCallback(
     async (id: string) => {
@@ -148,23 +178,14 @@ export function useVisitorChat(): VisitorChat {
     [mergeMessage],
   );
 
-  // Rejoin an existing conversation on mount.
+  // Rejoin an existing conversation on mount. Anything that goes wrong just
+  // offers a fresh conversation.
   useEffect(() => {
     let cancelled = false;
 
     void (async () => {
-      if (!isSupabaseConfigured()) {
-        if (!cancelled) {
-          setStatus("error");
-          setError(
-            "Live chat is unavailable: Supabase is not configured for this deployment. See /api/health.",
-          );
-        }
-        return;
-      }
-
       const stored = readStoredSession();
-      if (!stored) {
+      if (!stored || !isSupabaseConfigured()) {
         if (!cancelled) setStatus("new");
         return;
       }
@@ -174,7 +195,7 @@ export function useVisitorChat(): VisitorChat {
 
         const { data: session, error: sessionError } = await supabase
           .from("chat_sessions")
-          .select("id")
+          .select("id, visitor_name, visitor_email")
           .eq("id", stored)
           .maybeSingle();
 
@@ -197,13 +218,17 @@ export function useVisitorChat(): VisitorChat {
         if (historyError) throw historyError;
 
         if (cancelled) return;
+        const row = session as { visitor_name?: string | null; visitor_email?: string | null };
+        visitor.current = {
+          name: row.visitor_name || "Website visitor",
+          ...(row.visitor_email ? { email: row.visitor_email } : {}),
+        };
         setMessages((history ?? []) as ChatMessage[]);
         setSessionId(stored);
         setStatus("open");
       } catch (caught) {
-        if (cancelled) return;
-        setError(readableError(caught));
-        setStatus("error");
+        logChatFailure("rejoining the conversation", caught);
+        if (!cancelled) setStatus("new");
       }
     })();
 
@@ -214,7 +239,7 @@ export function useVisitorChat(): VisitorChat {
 
   // One subscription, filtered to this conversation.
   useEffect(() => {
-    if (!sessionId || !isSupabaseConfigured()) return;
+    if (!sessionId || isUnsaved(sessionId) || !isSupabaseConfigured()) return;
 
     const channel = supabase
       .channel(`chat:${sessionId}`)
@@ -247,7 +272,7 @@ export function useVisitorChat(): VisitorChat {
   // Poll as well: slowly while the channel is up, quickly when it is not, so a
   // staff reply still lands even where realtime is unavailable.
   useEffect(() => {
-    if (!sessionId || !isSupabaseConfigured()) return;
+    if (!sessionId || isUnsaved(sessionId) || !isSupabaseConfigured()) return;
     const id = setInterval(() => void syncMessages(sessionId), live ? 20000 : 4000);
     return () => clearInterval(id);
   }, [sessionId, live, syncMessages]);
@@ -255,8 +280,12 @@ export function useVisitorChat(): VisitorChat {
   const start = useCallback(
     async (input: { name: string; email: string; message: string }) => {
       setSending(true);
-      setError(null);
+      visitor.current = {
+        name: input.name,
+        ...(input.email ? { email: input.email } : {}),
+      };
       try {
+        if (!isSupabaseConfigured()) throw new Error("Supabase is not configured.");
         await ensureVisitorSession();
 
         // visitor_id defaults to auth.uid() in the database, so the row can
@@ -286,30 +315,34 @@ export function useVisitorChat(): VisitorChat {
         setSessionId(id);
         setStatus("open");
 
-        // Server function only rings the bell — the rows above are already written.
-        void notify({
-          data: {
-            kind: "chat",
-            sessionId: id,
-            name: input.name,
-            email: input.email || undefined,
-            message: input.message,
-          },
-        }).catch(() => undefined);
+        // Rows are already written; this only rings the bell.
+        void emailMessage(id, input.message);
       } catch (caught) {
-        setError(readableError(caught));
+        logChatFailure("starting a conversation", caught);
+        const id = `${UNSAVED_PREFIX}${newId()}`;
+        setMessages([localMessage(id, input.message)]);
+        setSessionId(id);
+        setStatus("open");
+        void emailMessage(id, input.message);
       } finally {
         setSending(false);
       }
     },
-    [notify],
+    [emailMessage],
   );
 
   const send = useCallback(
     async (body: string): Promise<boolean> => {
-      if (!sessionId || body.trim() === "") return false;
+      const text = body.trim();
+      if (!sessionId || text === "") return false;
+
+      if (isUnsaved(sessionId)) {
+        mergeMessage(localMessage(sessionId, text));
+        void emailMessage(sessionId, text);
+        return true;
+      }
+
       setSending(true);
-      setError(null);
       try {
         // The conversation is restored from localStorage, which outlives the
         // access token. Without this the insert can go out unauthenticated and
@@ -320,7 +353,7 @@ export function useVisitorChat(): VisitorChat {
         // waiting on the realtime round trip; mergeMessage drops the echo.
         const { data: message, error: insertError } = await supabase
           .from("chat_messages")
-          .insert({ session_id: sessionId, sender: "visitor", body: body.trim() })
+          .insert({ session_id: sessionId, sender: "visitor", body: text })
           .select("*")
           .single();
 
@@ -328,43 +361,33 @@ export function useVisitorChat(): VisitorChat {
         mergeMessage(message as ChatMessage);
         return true;
       } catch (caught) {
-        // Order matters. A request that never completed says nothing about who
-        // owns the conversation, and asking the database about it is both
-        // pointless and liable to answer "gone" for the same reason the write
-        // failed. Only a refusal is worth investigating.
-        const { kind, code, message } = describeError(caught);
-        const refused =
-          kind !== "network" &&
-          (code === "42501" ||
-            code === "PGRST301" ||
-            /row-level security|permission denied|not authorized|jwt/i.test(message));
+        logChatFailure("sending a message", caught);
 
-        if (refused && (await sessionIsLost(sessionId))) {
-          writeStoredSession(null);
-          setSessionId(null);
-          setMessages([]);
-          setStatus("new");
-          setError(
-            "That conversation is no longer open on this browser. Your message was not sent; start a new one below and it will reach us.",
-          );
-          return false;
-        }
-        setError(readableError(caught));
-        return false;
+        // A refusal can mean the conversation no longer belongs to this
+        // browser; forget it so the next visit starts clean. A request that
+        // never completed says nothing about ownership, so leave it alone.
+        const { kind } = describeError(caught);
+        if (kind !== "network" && (await sessionIsLost(sessionId))) writeStoredSession(null);
+
+        // Carry on by email for the rest of this conversation.
+        const id = `${UNSAVED_PREFIX}${newId()}`;
+        setSessionId(id);
+        mergeMessage(localMessage(id, text));
+        void emailMessage(id, text);
+        return true;
       } finally {
         setSending(false);
       }
     },
-    [sessionId, mergeMessage],
+    [sessionId, mergeMessage, emailMessage],
   );
 
   const reset = useCallback(() => {
     writeStoredSession(null);
     setSessionId(null);
     setMessages([]);
-    setError(null);
     setStatus("new");
   }, []);
 
-  return { status, sessionId, messages, error, sending, start, send, reset };
+  return { status, sessionId, messages, sending, start, send, reset };
 }
